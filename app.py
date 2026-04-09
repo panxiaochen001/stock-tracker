@@ -79,18 +79,12 @@ with tab1:
                     results = ds.fetch_selection_data(
                         select_date.strftime("%Y-%m-%d"), valid, note
                     )
-                ok   = [r for r in results if r["status"] == "ok"]
-                err  = [r for r in results if r["status"] == "error"]
-                skip = [r for r in results if r["status"] == "skip"]
+                ok  = [r for r in results if r["status"] == "ok"]
+                err = [r for r in results if r["status"] == "error"]
                 if ok:
                     st.success(
                         f"✅ 成功录入 {len(ok)} 只：" +
                         "、".join(f"{r['name']}({r['code']})" for r in ok)
-                    )
-                if skip:
-                    st.info(
-                        f"⏭️ 跳过 {len(skip)} 只（选股日+代码+备注完全相同）：" +
-                        "、".join(f"{r['name']}({r['code']})" for r in skip)
                     )
                 for r in err:
                     st.error(f"❌ {r['code']}：{r['msg']}")
@@ -106,28 +100,11 @@ with tab1:
         df_m.columns = ["ID", "选股日", "买入日", "代码", "名称", "买入价", "备注"]
         st.dataframe(df_m, use_container_width=True, hide_index=True)
 
-        st.divider()
-        dc1, dc2 = st.columns(2)
-
-        with dc1:
-            st.markdown("**按选股日批量删除**")
-            date_options = db.get_select_dates()
-            date_labels  = [f"{r['select_date']}（{r['cnt']} 只）" for r in date_options]
-            if date_labels:
-                chosen_label = st.selectbox("选择要删除的选股日", date_labels, key="del_date")
-                chosen_date  = date_options[date_labels.index(chosen_label)]["select_date"]
-                if st.button("🗑️ 删除该日所有记录", type="primary"):
-                    n = db.delete_by_date(chosen_date)
-                    st.success(f"已删除 {chosen_date} 的 {n} 条记录")
-                    st.rerun()
-
-        with dc2:
-            st.markdown("**按 ID 删除单条记录**")
-            del_id = st.number_input("输入记录 ID", min_value=1, step=1)
-            if st.button("🗑️ 删除该条记录"):
-                db.delete_selection(int(del_id))
-                st.success(f"已删除 ID={del_id}")
-                st.rerun()
+        del_id = st.number_input("输入要删除的记录 ID", min_value=1, step=1)
+        if st.button("🗑️ 删除该条记录"):
+            db.delete_selection(int(del_id))
+            st.success(f"已删除 ID={del_id}")
+            st.rerun()
     else:
         st.info("暂无记录，请先录入选股")
 
