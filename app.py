@@ -18,7 +18,6 @@ thead tr th { background-color: #1F3864 !important; color: white !important; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── 初始化数据库（幂等） ───────────────────────────────────
 @st.cache_resource
 def _init():
     db.init_db()
@@ -28,7 +27,6 @@ _init()
 PERIODS = ["5日", "10日", "1月", "2月", "3月"]
 
 
-# ── 格式化工具 ────────────────────────────────────────────
 def fmt_pct(tup):
     if not isinstance(tup, tuple) or tup[0] is None:
         return "—"
@@ -37,15 +35,16 @@ def fmt_pct(tup):
     return f"{prefix}{val:+.2f}%"
 
 
-# ════════════════════════════════════════════════════════
-# 页面标题
-# ════════════════════════════════════════════════════════
 st.title("📈 选股追踪系统")
 st.caption("买入价 = 选股日下一交易日开盘价 ｜ ▶ = 进行中（截至今日）｜ 红涨绿跌")
 
 # ── 全局数据（页面只查一次，避免连接池耗尽） ────────────
-all_selections  = db.get_all_selections()
+all_selections   = db.get_all_selections()
 all_date_options = db.get_select_dates()
+# 批量计算所有涨幅（只用少量DB查询，避免循环建连接）
+_today_str   = datetime.today().strftime("%Y%m%d")
+all_metrics  = ds.calc_all_metrics(all_selections, _today_str)
+_metrics_map = {sel["id"]: m for sel, m in zip(all_selections, all_metrics)}
 
 tab1, tab2, tab3 = st.tabs(["📥 录入选股", "📊 持仓看板", "📋 统计分析"])
 
@@ -99,7 +98,6 @@ with tab1:
                 for r in err:
                     st.error(f"❌ {r['code']}：{r['msg']}")
 
-    # 已录入记录管理
     st.divider()
     st.subheader("已录入记录")
     sels = all_selections
@@ -158,7 +156,7 @@ with tab2:
         st.success(f"已更新 {n} 条记录的价格数据")
         st.rerun()
 
-    sels = list(all_selections)  # 使用全局缓存
+    sels = list(all_selections)
     if f_start:
         sels = [s for s in sels if s["select_date"] >= f_start.strftime("%Y%m%d")]
     if f_end:
@@ -167,13 +165,10 @@ with tab2:
     if not sels:
         st.info("暂无数据，请先在「录入选股」页面录入")
     else:
-        today_str = datetime.today().strftime("%Y%m%d")
-
-        # 构建展示行
         display_rows = []
-        raw_rows     = []   # 保留原始tuple，供Excel用
+        raw_rows     = []
         for sel in sels:
-            metrics = ds.calc_metrics(sel, today_str)
+            metrics = _metrics_map.get(sel["id"], {})
             base = {
                 "代码":   sel["code"],
                 "名称":   sel["name"] or "",
@@ -191,8 +186,8 @@ with tab2:
                 "备注":       sel["note"] or "",
             }
             for p in PERIODS:
-                tup = metrics.get(f"{p}涨幅",     (None, ""))
-                htup= metrics.get(f"{p}最高涨幅", (None, ""))
+                tup  = metrics.get(f"{p}涨幅",     (None, ""))
+                htup = metrics.get(f"{p}最高涨幅", (None, ""))
                 base[f"{p}涨幅"]     = fmt_pct(tup)
                 base[f"{p}最高涨幅"] = fmt_pct(htup)
                 raw[f"{p}涨幅"]      = tup
@@ -213,7 +208,6 @@ with tab2:
             height=580,
         )
 
-        # Excel 下载
         st.divider()
         if st.button("📥 生成 Excel"):
             xlsx = ex.build_excel(raw_rows)
@@ -235,10 +229,9 @@ with tab3:
     if not sels:
         st.info("暂无数据")
     else:
-        today_str = datetime.today().strftime("%Y%m%d")
         all_m = []
         for sel in sels:
-            m = ds.calc_metrics(sel, today_str)
+            m = dict(_metrics_map.get(sel["id"], {}))
             m["select_date"] = sel["select_date"]
             all_m.append(m)
 
@@ -251,12 +244,11 @@ with tab3:
                 highs = [m[f"{p}最高涨幅"][0] for m in subset
                          if isinstance(m.get(f"{p}最高涨幅"), tuple)
                          and m[f"{p}最高涨幅"][0] is not None]
-                r[f"{p}均涨幅"] = f"{sum(vals)/len(vals):+.2f}%"  if vals  else "—"
+                r[f"{p}均涨幅"] = f"{sum(vals)/len(vals):+.2f}%"   if vals  else "—"
                 r[f"{p}均最高"] = f"{sum(highs)/len(highs):+.2f}%" if highs else "—"
                 r[f"{p}胜率"]   = f"{sum(1 for v in vals if v>0)/len(vals)*100:.0f}%" if vals else "—"
             return r
 
-        # 全局摘要
         st.markdown("### 全部选股汇总")
         total = _stats(all_m)
         cols  = st.columns(5)
@@ -269,7 +261,6 @@ with tab3:
 
         st.divider()
 
-        # 按选股日分组
         st.markdown("### 按选股日分组")
         stat_rows = []
         for dk, grp in groupby(
