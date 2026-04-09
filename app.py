@@ -26,7 +26,6 @@ _init()
 
 PERIODS = ["5日", "10日", "1月", "2月", "3月"]
 
-
 def fmt_pct(tup):
     if not isinstance(tup, tuple) or tup[0] is None:
         return "—"
@@ -34,17 +33,12 @@ def fmt_pct(tup):
     prefix = "▶ " if status == "进行中" else ""
     return f"{prefix}{val:+.2f}%"
 
-
 st.title("📈 选股追踪系统")
 st.caption("买入价 = 选股日下一交易日开盘价 ｜ ▶ = 进行中（截至今日）｜ 红涨绿跌")
 
-# ── 全局数据（页面只查一次，避免连接池耗尽） ────────────
+# 只查选股记录，不做价格计算
 all_selections   = db.get_all_selections()
 all_date_options = db.get_select_dates()
-# 批量计算所有涨幅（只用少量DB查询，避免循环建连接）
-_today_str   = datetime.today().strftime("%Y%m%d")
-all_metrics  = ds.calc_all_metrics(all_selections, _today_str)
-_metrics_map = {sel["id"]: m for sel, m in zip(all_selections, all_metrics)}
 
 tab1, tab2, tab3 = st.tabs(["📥 录入选股", "📊 持仓看板", "📋 统计分析"])
 
@@ -61,7 +55,6 @@ with tab1:
             "选股日期", value=date.today(), max_value=date.today()
         )
         note = st.text_input("备注标签（可选）", placeholder="趋势突破、低估值…")
-
     with col2:
         codes_input = st.text_area(
             "股票代码（每行一个）",
@@ -97,12 +90,12 @@ with tab1:
                     )
                 for r in err:
                     st.error(f"❌ {r['code']}：{r['msg']}")
+                st.session_state.pop("metrics_map", None)
 
     st.divider()
     st.subheader("已录入记录")
-    sels = all_selections
-    if sels:
-        df_m = pd.DataFrame(sels)[
+    if all_selections:
+        df_m = pd.DataFrame(all_selections)[
             ["id", "select_date", "buy_date", "code", "name", "buy_price", "note"]
         ]
         df_m.columns = ["ID", "选股日", "买入日", "代码", "名称", "买入价", "备注"]
@@ -110,25 +103,24 @@ with tab1:
 
         st.divider()
         dc1, dc2 = st.columns(2)
-
         with dc1:
             st.markdown("**按选股日批量删除**")
-            date_options = all_date_options
-            date_labels  = [f"{r['select_date']}（{r['cnt']} 只）" for r in date_options]
+            date_labels = [f"{r['select_date']}（{r['cnt']} 只）" for r in all_date_options]
             if date_labels:
                 chosen_label = st.selectbox("选择要删除的选股日", date_labels, key="del_date")
-                chosen_date  = date_options[date_labels.index(chosen_label)]["select_date"]
+                chosen_date  = all_date_options[date_labels.index(chosen_label)]["select_date"]
                 if st.button("🗑️ 删除该日所有记录", type="primary"):
                     n = db.delete_by_date(chosen_date)
                     st.success(f"已删除 {chosen_date} 的 {n} 条记录")
+                    st.session_state.pop("metrics_map", None)
                     st.rerun()
-
         with dc2:
             st.markdown("**按 ID 删除单条记录**")
             del_id = st.number_input("输入记录 ID", min_value=1, step=1)
             if st.button("🗑️ 删除该条记录"):
                 db.delete_selection(int(del_id))
                 st.success(f"已删除 ID={del_id}")
+                st.session_state.pop("metrics_map", None)
                 st.rerun()
     else:
         st.info("暂无记录，请先录入选股")
@@ -153,70 +145,84 @@ with tab2:
     if do_refresh:
         with st.spinner("正在从 Tushare 拉取最新价格…"):
             n = ds.refresh_prices()
+        st.session_state.pop("metrics_map", None)
         st.success(f"已更新 {n} 条记录的价格数据")
         st.rerun()
 
-    sels = list(all_selections)
-    if f_start:
-        sels = [s for s in sels if s["select_date"] >= f_start.strftime("%Y%m%d")]
-    if f_end:
-        sels = [s for s in sels if s["select_date"] <= f_end.strftime("%Y%m%d")]
-
-    if not sels:
+    if not all_selections:
         st.info("暂无数据，请先在「录入选股」页面录入")
     else:
-        display_rows = []
-        raw_rows     = []
-        for sel in sels:
-            metrics = _metrics_map.get(sel["id"], {})
-            base = {
-                "代码":   sel["code"],
-                "名称":   sel["name"] or "",
-                "选股日": sel["select_date"],
-                "买入日": sel["buy_date"] or "",
-                "买入价": f"{sel['buy_price']:.2f}" if sel["buy_price"] else "—",
-                "备注":   sel["note"] or "",
-            }
-            raw = {
-                "股票代码":   sel["code"],
-                "股票名称":   sel["name"] or "",
-                "选股日":     sel["select_date"],
-                "买入日":     sel["buy_date"] or "",
-                "买入价(元)": sel["buy_price"],
-                "备注":       sel["note"] or "",
-            }
-            for p in PERIODS:
-                tup  = metrics.get(f"{p}涨幅",     (None, ""))
-                htup = metrics.get(f"{p}最高涨幅", (None, ""))
-                base[f"{p}涨幅"]     = fmt_pct(tup)
-                base[f"{p}最高涨幅"] = fmt_pct(htup)
-                raw[f"{p}涨幅"]      = tup
-                raw[f"{p}最高涨幅"]  = htup
-            display_rows.append(base)
-            raw_rows.append(raw)
+        if "metrics_map" not in st.session_state:
+            with st.spinner("正在计算涨幅数据…"):
+                today_str   = datetime.today().strftime("%Y%m%d")
+                all_metrics = ds.calc_all_metrics(all_selections, today_str)
+                st.session_state["metrics_map"] = {
+                    sel["id"]: m for sel, m in zip(all_selections, all_metrics)
+                }
 
-        display_cols = (
-            ["代码", "名称", "选股日", "买入日", "买入价"]
-            + [f"{p}涨幅"     for p in PERIODS]
-            + [f"{p}最高涨幅" for p in PERIODS]
-            + ["备注"]
-        )
-        st.dataframe(
-            pd.DataFrame(display_rows)[display_cols],
-            use_container_width=True,
-            hide_index=True,
-            height=580,
-        )
+        metrics_map = st.session_state["metrics_map"]
 
-        st.divider()
-        if st.button("📥 生成 Excel"):
-            xlsx = ex.build_excel(raw_rows)
-            st.download_button(
-                label="⬇️ 下载 Excel",
-                data=xlsx,
-                file_name=f"选股追踪_{datetime.today().strftime('%Y%m%d')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        sels = list(all_selections)
+        if f_start:
+            sels = [s for s in sels if s["select_date"] >= f_start.strftime("%Y%m%d")]
+        if f_end:
+            sels = [s for s in sels if s["select_date"] <= f_end.strftime("%Y%m%d")]
+
+        if not sels:
+            st.info("筛选范围内暂无数据")
+        else:
+            display_rows = []
+            raw_rows     = []
+            for sel in sels:
+                metrics = metrics_map.get(sel["id"], {})
+                base = {
+                    "代码":   sel["code"],
+                    "名称":   sel["name"] or "",
+                    "选股日": sel["select_date"],
+                    "买入日": sel["buy_date"] or "",
+                    "买入价": f"{sel['buy_price']:.2f}" if sel["buy_price"] else "—",
+                    "备注":   sel["note"] or "",
+                }
+                raw = {
+                    "股票代码":   sel["code"],
+                    "股票名称":   sel["name"] or "",
+                    "选股日":     sel["select_date"],
+                    "买入日":     sel["buy_date"] or "",
+                    "买入价(元)": sel["buy_price"],
+                    "备注":       sel["note"] or "",
+                }
+                for p in PERIODS:
+                    tup  = metrics.get(f"{p}涨幅",     (None, ""))
+                    htup = metrics.get(f"{p}最高涨幅", (None, ""))
+                    base[f"{p}涨幅"]     = fmt_pct(tup)
+                    base[f"{p}最高涨幅"] = fmt_pct(htup)
+                    raw[f"{p}涨幅"]      = tup
+                    raw[f"{p}最高涨幅"]  = htup
+                display_rows.append(base)
+                raw_rows.append(raw)
+
+            display_cols = (
+                ["代码", "名称", "选股日", "买入日", "买入价"]
+                + [f"{p}涨幅"     for p in PERIODS]
+                + [f"{p}最高涨幅" for p in PERIODS]
+                + ["备注"]
             )
+            st.dataframe(
+                pd.DataFrame(display_rows)[display_cols],
+                use_container_width=True,
+                hide_index=True,
+                height=580,
+            )
+
+            st.divider()
+            if st.button("📥 生成 Excel"):
+                xlsx = ex.build_excel(raw_rows)
+                st.download_button(
+                    label="⬇️ 下载 Excel",
+                    data=xlsx,
+                    file_name=f"选股追踪_{datetime.today().strftime('%Y%m%d')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
 
 
 # ════════════════════════════════════════════════════════
@@ -225,58 +231,60 @@ with tab2:
 with tab3:
     st.subheader("统计分析")
 
-    sels = all_selections
-    if not sels:
+    if not all_selections:
         st.info("暂无数据")
     else:
-        all_m = []
-        for sel in sels:
-            m = dict(_metrics_map.get(sel["id"], {}))
-            m["select_date"] = sel["select_date"]
-            all_m.append(m)
+        if "metrics_map" not in st.session_state:
+            st.info("请先前往「持仓看板」Tab 加载数据")
+        else:
+            metrics_map = st.session_state["metrics_map"]
+            all_m = []
+            for sel in all_selections:
+                m = dict(metrics_map.get(sel["id"], {}))
+                m["select_date"] = sel["select_date"]
+                all_m.append(m)
 
-        def _stats(subset):
-            r = {}
-            for p in PERIODS:
-                vals  = [m[f"{p}涨幅"][0]     for m in subset
-                         if isinstance(m.get(f"{p}涨幅"), tuple)
-                         and m[f"{p}涨幅"][0] is not None]
-                highs = [m[f"{p}最高涨幅"][0] for m in subset
-                         if isinstance(m.get(f"{p}最高涨幅"), tuple)
-                         and m[f"{p}最高涨幅"][0] is not None]
-                r[f"{p}均涨幅"] = f"{sum(vals)/len(vals):+.2f}%"   if vals  else "—"
-                r[f"{p}均最高"] = f"{sum(highs)/len(highs):+.2f}%" if highs else "—"
-                r[f"{p}胜率"]   = f"{sum(1 for v in vals if v>0)/len(vals)*100:.0f}%" if vals else "—"
-            return r
+            def _stats(subset):
+                r = {}
+                for p in PERIODS:
+                    vals  = [m[f"{p}涨幅"][0]     for m in subset
+                             if isinstance(m.get(f"{p}涨幅"), tuple)
+                             and m[f"{p}涨幅"][0] is not None]
+                    highs = [m[f"{p}最高涨幅"][0] for m in subset
+                             if isinstance(m.get(f"{p}最高涨幅"), tuple)
+                             and m[f"{p}最高涨幅"][0] is not None]
+                    r[f"{p}均涨幅"] = f"{sum(vals)/len(vals):+.2f}%"   if vals  else "—"
+                    r[f"{p}均最高"] = f"{sum(highs)/len(highs):+.2f}%" if highs else "—"
+                    r[f"{p}胜率"]   = f"{sum(1 for v in vals if v>0)/len(vals)*100:.0f}%" if vals else "—"
+                return r
 
-        st.markdown("### 全部选股汇总")
-        total = _stats(all_m)
-        cols  = st.columns(5)
-        for col, p in zip(cols, PERIODS):
-            col.metric(f"{p} 均涨幅", total[f"{p}均涨幅"])
-        st.markdown("#### 各周期胜率")
-        cols2 = st.columns(5)
-        for col, p in zip(cols2, PERIODS):
-            col.metric(f"{p} 胜率", total[f"{p}胜率"])
+            st.markdown("### 全部选股汇总")
+            total = _stats(all_m)
+            cols  = st.columns(5)
+            for col, p in zip(cols, PERIODS):
+                col.metric(f"{p} 均涨幅", total[f"{p}均涨幅"])
+            st.markdown("#### 各周期胜率")
+            cols2 = st.columns(5)
+            for col, p in zip(cols2, PERIODS):
+                col.metric(f"{p} 胜率", total[f"{p}胜率"])
 
-        st.divider()
+            st.divider()
+            st.markdown("### 按选股日分组")
+            stat_rows = []
+            for dk, grp in groupby(
+                sorted(all_m, key=lambda x: x["select_date"]),
+                key=lambda x: x["select_date"]
+            ):
+                g = list(grp)
+                r = {"选股日": dk, "股票数": len(g)}
+                r.update(_stats(g))
+                stat_rows.append(r)
 
-        st.markdown("### 按选股日分组")
-        stat_rows = []
-        for dk, grp in groupby(
-            sorted(all_m, key=lambda x: x["select_date"]),
-            key=lambda x: x["select_date"]
-        ):
-            g = list(grp)
-            r = {"选股日": dk, "股票数": len(g)}
-            r.update(_stats(g))
-            stat_rows.append(r)
-
-        show_cols = (["选股日", "股票数"]
-                     + [f"{p}均涨幅" for p in PERIODS]
-                     + [f"{p}胜率"   for p in PERIODS])
-        st.dataframe(
-            pd.DataFrame(stat_rows)[show_cols],
-            use_container_width=True,
-            hide_index=True,
-        )
+            show_cols = (["选股日", "股票数"]
+                         + [f"{p}均涨幅" for p in PERIODS]
+                         + [f"{p}胜率"   for p in PERIODS])
+            st.dataframe(
+                pd.DataFrame(stat_rows)[show_cols],
+                use_container_width=True,
+                hide_index=True,
+            )
