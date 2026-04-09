@@ -17,7 +17,6 @@ def get_conn():
         user=cfg["user"],
         password=cfg["password"],
         sslmode="require",
-        # Session pooler 需要关闭 prepared statements
         options="-c default_transaction_isolation='read committed'",
         cursor_factory=psycopg2.extras.RealDictCursor,
     )
@@ -78,7 +77,6 @@ def upsert_prices_batch(records: list[tuple]):
     """批量写入，records = [(code, trade_date, open, high, close), ...]"""
     if not records:
         return
-    # 强制转换为原生 Python float，避免 np.float64 传入 PostgreSQL 报错
     records = [(r[0], r[1], float(r[2]), float(r[3]), float(r[4])) for r in records]
     conn = get_conn()
     with conn.cursor() as c:
@@ -110,7 +108,6 @@ def get_prices(code, start, end):
 
 # ── 交易日历 ──────────────────────────────────────────────
 def upsert_calendar(records: list[tuple]):
-    """records = [(trade_date, is_open), ...]"""
     if not records:
         return
     conn = get_conn()
@@ -160,13 +157,31 @@ def calendar_count():
 
 
 # ── 选股记录 ──────────────────────────────────────────────
+def is_duplicate(select_date, code, note):
+    """
+    判断是否重复：同选股日 + 同代码 + 同备注 → True（跳过）
+    同选股日 + 同代码 + 不同备注 → False（允许新增）
+    """
+    conn = get_conn()
+    with conn.cursor() as c:
+        c.execute("""
+            SELECT id FROM selections
+            WHERE select_date=%s AND code=%s AND note=%s
+            LIMIT 1
+        """, (select_date, code, note or ""))
+        row = c.fetchone()
+    conn.close()
+    return row is not None
+
+
 def insert_selection(select_date, buy_date, code, name, buy_price, note):
     conn = get_conn()
     with conn.cursor() as c:
         c.execute("""
             INSERT INTO selections(select_date, buy_date, code, name, buy_price, note)
             VALUES (%s, %s, %s, %s, %s, %s)
-        """, (select_date, buy_date, code, name, float(buy_price) if buy_price else None, note))
+        """, (select_date, buy_date, code, name,
+              float(buy_price) if buy_price else None, note or ""))
     conn.commit()
     conn.close()
 
@@ -180,9 +195,36 @@ def get_all_selections():
     return [dict(r) for r in rows]
 
 
+def get_select_dates():
+    """返回所有已有的选股日列表，供批量删除使用"""
+    conn = get_conn()
+    with conn.cursor() as c:
+        c.execute("""
+            SELECT DISTINCT select_date, COUNT(*) AS cnt
+            FROM selections
+            GROUP BY select_date
+            ORDER BY select_date DESC
+        """)
+        rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def delete_selection(sel_id):
+    """按 ID 删除单条记录"""
     conn = get_conn()
     with conn.cursor() as c:
         c.execute("DELETE FROM selections WHERE id=%s", (sel_id,))
     conn.commit()
     conn.close()
+
+
+def delete_by_date(select_date):
+    """删除某个选股日的所有记录"""
+    conn = get_conn()
+    with conn.cursor() as c:
+        c.execute("DELETE FROM selections WHERE select_date=%s", (select_date,))
+        deleted = c.rowcount
+    conn.commit()
+    conn.close()
+    return deleted

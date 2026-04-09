@@ -214,14 +214,21 @@ def fetch_selection_data(select_date: str, codes: list[str], note: str = "") -> 
                    + relativedelta(months=3, days=10)).strftime("%Y%m%d")
             fetch_price_range(code, buy_date, far)
 
-            db.insert_selection(
-                select_date.replace("-", ""), buy_date,
-                code, name, buy_price, note
-            )
-            results.append({
-                "code": code, "name": name, "status": "ok",
-                "buy_date": buy_date, "buy_price": buy_price
-            })
+            select_date_str = select_date.replace("-", "")
+            if db.is_duplicate(select_date_str, code, note):
+                results.append({
+                    "code": code, "name": name, "status": "skip",
+                    "msg": "已存在相同选股日+代码+备注，已跳过"
+                })
+            else:
+                db.insert_selection(
+                    select_date_str, buy_date,
+                    code, name, buy_price, note
+                )
+                results.append({
+                    "code": code, "name": name, "status": "ok",
+                    "buy_date": buy_date, "buy_price": buy_price
+                })
         except Exception as e:
             results.append({"code": code, "status": "error", "msg": str(e)})
 
