@@ -321,7 +321,13 @@ def calc_all_metrics(sels: list[dict], today_str: str) -> list[dict]:
             result[f"{label}涨幅"], result[f"{label}最高涨幅"] = compute(interval, target)
 
         for m, label in [(1, "1月"), (2, "2月"), (3, "3月")]:
-            expiry   = calc_expiry_date(buy_date, m)
+            # 纯内存计算到期日，不查数据库
+            dt = datetime.strptime(buy_date, "%Y%m%d")
+            expiry_dt = dt + relativedelta(months=m)
+            expiry_str = expiry_dt.strftime("%Y%m%d")
+            # 从已有交易日列表找最近交易日
+            future = [d for d in all_trade_days if d >= expiry_str]
+            expiry = future[0] if future else expiry_str
             interval = [d for d in sel_days if d > buy_date and d <= expiry]
             result[f"{label}涨幅"], result[f"{label}最高涨幅"] = compute(interval, expiry)
 
