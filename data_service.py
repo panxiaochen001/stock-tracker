@@ -255,40 +255,30 @@ def refresh_prices() -> int:
 
 def calc_all_metrics(sels: list[dict], today_str: str) -> list[dict]:
     """
-    批量计算所有选股记录的涨幅指标。
-    只做2次数据库查询（price_cache + trade_calendar），
-    避免在循环里反复建连接导致连接池耗尽。
+    批量计算所有涨幅。
+    用 get_prices_multi 一次查询拿所有价格，再用 get_trade_days 拿交易日历。
+    总共只有 2 次数据库连接。
     """
     if not sels:
         return []
 
-    # 找出所有涉及的日期范围
-    all_codes = list({s["code"] for s in sels if s.get("buy_date")})
-    min_date  = min((s["buy_date"] for s in sels if s.get("buy_date")), default=None)
-    if not min_date:
+    valid = [s for s in sels if s.get("buy_date")]
+    if not valid:
         return [{} for _ in sels]
 
-    far_end = min(
-        (datetime.strptime(min_date, "%Y%m%d") + relativedelta(months=4, days=10)).strftime("%Y%m%d"),
-        today_str
-    )
-    # 取最晚的buy_date往后推4个月
-    max_buy  = max(s["buy_date"] for s in sels if s.get("buy_date"))
-    far_end2 = min(
+    min_date = min(s["buy_date"] for s in valid)
+    max_buy  = max(s["buy_date"] for s in valid)
+    far_end  = min(
         (datetime.strptime(max_buy, "%Y%m%d") + relativedelta(months=4, days=10)).strftime("%Y%m%d"),
         today_str
     )
-    far_end  = max(far_end, far_end2)
 
-    # 一次性拉所有交易日
-    all_trade_days_list = db.get_trade_days(min_date, far_end)
-    trade_day_set       = set(all_trade_days_list)
+    # 1次查询：所有交易日
+    all_trade_days = db.get_trade_days(min_date, far_end)
 
-    # 一次性拉所有股票价格（按code分组）
-    price_by_code: dict[str, dict[str, dict]] = {}
-    for code in all_codes:
-        rows = db.get_prices(code, min_date, far_end)
-        price_by_code[code] = {r["trade_date"]: r for r in rows}
+    # 1次查询：所有股票价格
+    all_codes = list({s["code"] for s in valid})
+    price_by_code = db.get_prices_multi(all_codes, min_date, far_end)
 
     results = []
     for sel in sels:
@@ -296,19 +286,23 @@ def calc_all_metrics(sels: list[dict], today_str: str) -> list[dict]:
         buy_date  = sel.get("buy_date")
         buy_price = sel.get("buy_price")
 
-        if not buy_date or not buy_price or buy_price == 0 or code not in price_by_code:
+        if not buy_date or not buy_price or buy_price == 0:
             results.append({})
             continue
 
-        price_map      = price_by_code[code]
-        sel_trade_days = sorted(d for d in price_map if d >= buy_date)
+        price_map = price_by_code.get(code, {})
+        if not price_map:
+            results.append({})
+            continue
 
-        def pct(price):
-            return round((price / buy_price - 1) * 100, 2)
+        sel_days = [d for d in all_trade_days if d >= buy_date and d in price_map]
+
+        def pct(price, bp=buy_price):
+            return round((price / bp - 1) * 100, 2)
 
         def compute(interval_days, target_date):
             status = "进行中" if target_date > today_str else "已完成"
-            days   = [d for d in interval_days if d <= today_str] if status == "进行中" else interval_days
+            days = [d for d in interval_days if d <= today_str] if status == "进行中" else list(interval_days)
             if not days:
                 return (None, status), (None, status)
             close = price_map[days[-1]]["close"]
@@ -317,20 +311,18 @@ def calc_all_metrics(sels: list[dict], today_str: str) -> list[dict]:
 
         result = {}
 
-        # 5日、10日
         for n, label in [(5, "5日"), (10, "10日")]:
-            after = [d for d in sel_trade_days if d > buy_date]
+            after = [d for d in sel_days if d > buy_date]
             target = after[n - 1] if len(after) >= n else None
             if target is None:
                 result[f"{label}涨幅"] = result[f"{label}最高涨幅"] = (None, "未到期")
                 continue
-            interval = [d for d in sel_trade_days if d > buy_date and d <= target]
+            interval = [d for d in sel_days if d > buy_date and d <= target]
             result[f"{label}涨幅"], result[f"{label}最高涨幅"] = compute(interval, target)
 
-        # 1月、2月、3月
         for m, label in [(1, "1月"), (2, "2月"), (3, "3月")]:
             expiry   = calc_expiry_date(buy_date, m)
-            interval = [d for d in sel_trade_days if d > buy_date and d <= expiry]
+            interval = [d for d in sel_days if d > buy_date and d <= expiry]
             result[f"{label}涨幅"], result[f"{label}最高涨幅"] = compute(interval, expiry)
 
         results.append(result)
