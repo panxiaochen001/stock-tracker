@@ -1,0 +1,14 @@
+# Streamlit secrets（绝对不能提交到GitHub）
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+.venv/
+
+# 本地数据库（旧版SQLite，云版不需要）
+data/
+*.db
