@@ -43,6 +43,10 @@ def fmt_pct(tup):
 st.title("📈 选股追踪系统")
 st.caption("买入价 = 选股日下一交易日开盘价 ｜ ▶ = 进行中（截至今日）｜ 红涨绿跌")
 
+# ── 全局数据（页面只查一次，避免连接池耗尽） ────────────
+all_selections  = db.get_all_selections()
+all_date_options = db.get_select_dates()
+
 tab1, tab2, tab3 = st.tabs(["📥 录入选股", "📊 持仓看板", "📋 统计分析"])
 
 
@@ -79,12 +83,18 @@ with tab1:
                     results = ds.fetch_selection_data(
                         select_date.strftime("%Y-%m-%d"), valid, note
                     )
-                ok  = [r for r in results if r["status"] == "ok"]
-                err = [r for r in results if r["status"] == "error"]
+                ok   = [r for r in results if r["status"] == "ok"]
+                err  = [r for r in results if r["status"] == "error"]
+                skip = [r for r in results if r["status"] == "skip"]
                 if ok:
                     st.success(
                         f"✅ 成功录入 {len(ok)} 只：" +
                         "、".join(f"{r['name']}({r['code']})" for r in ok)
+                    )
+                if skip:
+                    st.info(
+                        f"⏭️ 跳过 {len(skip)} 只（选股日+代码+备注完全相同）：" +
+                        "、".join(f"{r['name']}({r['code']})" for r in skip)
                     )
                 for r in err:
                     st.error(f"❌ {r['code']}：{r['msg']}")
@@ -92,7 +102,7 @@ with tab1:
     # 已录入记录管理
     st.divider()
     st.subheader("已录入记录")
-    sels = db.get_all_selections()
+    sels = all_selections
     if sels:
         df_m = pd.DataFrame(sels)[
             ["id", "select_date", "buy_date", "code", "name", "buy_price", "note"]
@@ -100,11 +110,28 @@ with tab1:
         df_m.columns = ["ID", "选股日", "买入日", "代码", "名称", "买入价", "备注"]
         st.dataframe(df_m, use_container_width=True, hide_index=True)
 
-        del_id = st.number_input("输入要删除的记录 ID", min_value=1, step=1)
-        if st.button("🗑️ 删除该条记录"):
-            db.delete_selection(int(del_id))
-            st.success(f"已删除 ID={del_id}")
-            st.rerun()
+        st.divider()
+        dc1, dc2 = st.columns(2)
+
+        with dc1:
+            st.markdown("**按选股日批量删除**")
+            date_options = all_date_options
+            date_labels  = [f"{r['select_date']}（{r['cnt']} 只）" for r in date_options]
+            if date_labels:
+                chosen_label = st.selectbox("选择要删除的选股日", date_labels, key="del_date")
+                chosen_date  = date_options[date_labels.index(chosen_label)]["select_date"]
+                if st.button("🗑️ 删除该日所有记录", type="primary"):
+                    n = db.delete_by_date(chosen_date)
+                    st.success(f"已删除 {chosen_date} 的 {n} 条记录")
+                    st.rerun()
+
+        with dc2:
+            st.markdown("**按 ID 删除单条记录**")
+            del_id = st.number_input("输入记录 ID", min_value=1, step=1)
+            if st.button("🗑️ 删除该条记录"):
+                db.delete_selection(int(del_id))
+                st.success(f"已删除 ID={del_id}")
+                st.rerun()
     else:
         st.info("暂无记录，请先录入选股")
 
@@ -131,7 +158,7 @@ with tab2:
         st.success(f"已更新 {n} 条记录的价格数据")
         st.rerun()
 
-    sels = db.get_all_selections()
+    sels = list(all_selections)  # 使用全局缓存
     if f_start:
         sels = [s for s in sels if s["select_date"] >= f_start.strftime("%Y%m%d")]
     if f_end:
@@ -204,7 +231,7 @@ with tab2:
 with tab3:
     st.subheader("统计分析")
 
-    sels = db.get_all_selections()
+    sels = all_selections
     if not sels:
         st.info("暂无数据")
     else:
