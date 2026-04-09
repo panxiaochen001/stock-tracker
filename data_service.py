@@ -1,287 +1,338 @@
+"""
+data_service.py  —  Tushare 数据拉取 & 涨幅计算
+Token 从 st.secrets["TUSHARE_TOKEN"] 读取，不硬编码
+"""
+import tushare as ts
 import streamlit as st
-import pandas as pd
-from datetime import datetime, date
-from itertools import groupby
+from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
 import db
-import data_service as ds
-import excel_export as ex
 
-st.set_page_config(
-    page_title="选股追踪系统",
-    page_icon="📈",
-    layout="wide",
-)
+# ── Tushare 初始化 ────────────────────────────────────────
+_pro = None
 
-st.markdown("""
-<style>
-thead tr th { background-color: #1F3864 !important; color: white !important; }
-</style>
-""", unsafe_allow_html=True)
-
-# ── 初始化数据库（幂等） ───────────────────────────────────
-@st.cache_resource
-def _init():
-    db.init_db()
-
-_init()
-
-PERIODS = ["5日", "10日", "1月", "2月", "3月"]
+def get_pro():
+    global _pro
+    if _pro is None:
+        token = st.secrets["TUSHARE_TOKEN"]
+        ts.set_token(token)
+        _pro = ts.pro_api()
+    return _pro
 
 
-# ── 格式化工具 ────────────────────────────────────────────
-def fmt_pct(tup):
-    if not isinstance(tup, tuple) or tup[0] is None:
-        return "—"
-    val, status = tup
-    prefix = "▶ " if status == "进行中" else ""
-    return f"{prefix}{val:+.2f}%"
+# ── 代码标准化 ────────────────────────────────────────────
+def normalize_code(raw: str) -> str | None:
+    raw = raw.strip().upper()
+    if not raw:
+        return None
+    # 同花顺格式：SH600519 / SZ000001
+    if (raw.startswith("SH") or raw.startswith("SZ")) and len(raw) == 8:
+        prefix = raw[:2]
+        code6  = raw[2:]
+        if code6.isdigit():
+            return f"{code6}.{prefix}"
+    # 已是标准格式：600519.SH / 000001.SZ
+    if "." in raw:
+        parts = raw.split(".")
+        if len(parts) == 2 and len(parts[0]) == 6 and parts[0].isdigit():
+            if parts[1] in ("SH", "SZ", "BJ"):
+                return raw
+            if parts[1] == "SS":
+                return f"{parts[0]}.SH"
+    # 纯6位数字
+    if len(raw) == 6 and raw.isdigit():
+        if raw.startswith("6") or raw.startswith("688") or raw.startswith("689"):
+            return f"{raw}.SH"
+        if raw.startswith("0") or raw.startswith("3"):
+            return f"{raw}.SZ"
+        if raw.startswith("8") or raw.startswith("4"):
+            return f"{raw}.BJ"
+    return None
 
 
-# ════════════════════════════════════════════════════════
-# 页面标题
-# ════════════════════════════════════════════════════════
-st.title("📈 选股追踪系统")
-st.caption("买入价 = 选股日下一交易日开盘价 ｜ ▶ = 进行中（截至今日）｜ 红涨绿跌")
+def parse_codes(text: str) -> tuple[list[str], list[str]]:
+    valid, invalid = [], []
+    seen = set()
+    for line in text.strip().splitlines():
+        for part in line.replace(",", " ").replace("\t", " ").split():
+            code = normalize_code(part)
+            if code and code not in seen:
+                valid.append(code)
+                seen.add(code)
+            elif not code:
+                invalid.append(part)
+    return valid, invalid
 
-# ── 全局数据（页面只查一次，避免连接池耗尽） ────────────
-all_selections   = db.get_all_selections()
-all_date_options = db.get_select_dates()
 
-tab1, tab2, tab3 = st.tabs(["📥 录入选股", "📊 持仓看板", "📋 统计分析"])
-
-
-# ════════════════════════════════════════════════════════
-# Tab 1：录入选股
-# ════════════════════════════════════════════════════════
-with tab1:
-    st.subheader("录入选股记录")
-
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        select_date = st.date_input(
-            "选股日期", value=date.today(), max_value=date.today()
+# ── 交易日历 ──────────────────────────────────────────────
+def ensure_calendar():
+    pro = get_pro()
+    if db.calendar_count() < 200:
+        this_year = datetime.today().year
+        df = pro.trade_cal(
+            exchange="SSE",
+            start_date="20200101",
+            end_date=f"{this_year + 1}1231"
         )
-        note = st.text_input("备注标签（可选）", placeholder="趋势突破、低估值…")
-
-    with col2:
-        codes_input = st.text_area(
-            "股票代码（每行一个）",
-            height=160,
-            placeholder="SH600519\nSZ000001\n300750\n600036.SH",
-            help="支持同花顺格式 SH600519 / 纯6位 600519 / 标准格式 600519.SH"
-        )
-
-    if st.button("✅ 提交并拉取数据", type="primary"):
-        if not codes_input.strip():
-            st.warning("请输入至少一个股票代码")
-        else:
-            valid, invalid = ds.parse_codes(codes_input)
-            if invalid:
-                st.warning(f"无法识别，已跳过：{', '.join(invalid)}")
-            if valid:
-                with st.spinner(f"正在拉取 {len(valid)} 只股票数据，请稍候…"):
-                    results = ds.fetch_selection_data(
-                        select_date.strftime("%Y-%m-%d"), valid, note
-                    )
-                ok   = [r for r in results if r["status"] == "ok"]
-                err  = [r for r in results if r["status"] == "error"]
-                skip = [r for r in results if r["status"] == "skip"]
-                if ok:
-                    st.success(
-                        f"✅ 成功录入 {len(ok)} 只：" +
-                        "、".join(f"{r['name']}({r['code']})" for r in ok)
-                    )
-                if skip:
-                    st.info(
-                        f"⏭️ 跳过 {len(skip)} 只（选股日+代码+备注完全相同）：" +
-                        "、".join(f"{r['name']}({r['code']})" for r in skip)
-                    )
-                for r in err:
-                    st.error(f"❌ {r['code']}：{r['msg']}")
-
-    # 已录入记录管理
-    st.divider()
-    st.subheader("已录入记录")
-    sels = all_selections
-    if sels:
-        df_m = pd.DataFrame(sels)[
-            ["id", "select_date", "buy_date", "code", "name", "buy_price", "note"]
-        ]
-        df_m.columns = ["ID", "选股日", "买入日", "代码", "名称", "买入价", "备注"]
-        st.dataframe(df_m, use_container_width=True, hide_index=True)
-
-        st.divider()
-        dc1, dc2 = st.columns(2)
-
-        with dc1:
-            st.markdown("**按选股日批量删除**")
-            date_options = all_date_options
-            date_labels  = [f"{r['select_date']}（{r['cnt']} 只）" for r in date_options]
-            if date_labels:
-                chosen_label = st.selectbox("选择要删除的选股日", date_labels, key="del_date")
-                chosen_date  = date_options[date_labels.index(chosen_label)]["select_date"]
-                if st.button("🗑️ 删除该日所有记录", type="primary"):
-                    n = db.delete_by_date(chosen_date)
-                    st.success(f"已删除 {chosen_date} 的 {n} 条记录")
-                    st.rerun()
-
-        with dc2:
-            st.markdown("**按 ID 删除单条记录**")
-            del_id = st.number_input("输入记录 ID", min_value=1, step=1)
-            if st.button("🗑️ 删除该条记录"):
-                db.delete_selection(int(del_id))
-                st.success(f"已删除 ID={del_id}")
-                st.rerun()
-    else:
-        st.info("暂无记录，请先录入选股")
+        records = [(row["cal_date"], 1 if row["is_open"] == 1 else 0)
+                   for _, row in df.iterrows()]
+        db.upsert_calendar(records)
 
 
-# ════════════════════════════════════════════════════════
-# Tab 2：持仓看板
-# ════════════════════════════════════════════════════════
-with tab2:
-    st.subheader("持仓看板")
+# ── 价格数据 ──────────────────────────────────────────────
+def fetch_price_range(code: str, start: str, end: str):
+    """拉取价格并写入缓存，已有的跳过"""
+    existing = {r["trade_date"] for r in db.get_prices(code, start, end)}
+    trade_days = db.get_trade_days(start, end)
+    if not set(trade_days) - existing:
+        return  # 全部已缓存
 
-    fc1, fc2, fc3 = st.columns([2, 2, 1])
-    with fc1:
-        f_start = st.date_input("选股日 从", value=None, key="fs")
-    with fc2:
-        f_end   = st.date_input("选股日 至", value=None, key="fe")
-    with fc3:
-        st.write("")
-        st.write("")
-        do_refresh = st.button("🔄 更新数据", type="primary")
+    pro = get_pro()
+    df = pro.daily(
+        ts_code=code, start_date=start, end_date=end,
+        fields="ts_code,trade_date,open,high,close"
+    )
+    if df is None or df.empty:
+        return
 
-    if do_refresh:
-        with st.spinner("正在从 Tushare 拉取最新价格…"):
-            n = ds.refresh_prices()
-        st.success(f"已更新 {n} 条记录的价格数据")
-        st.rerun()
+    records = [
+        (code, row["trade_date"], row["open"], row["high"], row["close"])
+        for _, row in df.iterrows()
+    ]
+    db.upsert_prices_batch(records)
 
-    sels = list(all_selections)
-    if f_start:
-        sels = [s for s in sels if s["select_date"] >= f_start.strftime("%Y%m%d")]
-    if f_end:
-        sels = [s for s in sels if s["select_date"] <= f_end.strftime("%Y%m%d")]
 
-    if not sels:
-        st.info("暂无数据，请先在「录入选股」页面录入")
-    else:
-        today_str = datetime.today().strftime("%Y%m%d")
+def get_stock_name(code: str) -> str:
+    try:
+        pro = get_pro()
+        df = pro.stock_basic(ts_code=code, fields="ts_code,name")
+        if not df.empty:
+            return df.iloc[0]["name"]
+    except Exception:
+        pass
+    return code
 
-        display_rows = []
-        raw_rows     = []
-        for sel in sels:
-            metrics = ds.calc_metrics(sel, today_str)
-            base = {
-                "代码":   sel["code"],
-                "名称":   sel["name"] or "",
-                "选股日": sel["select_date"],
-                "买入日": sel["buy_date"] or "",
-                "买入价": f"{sel['buy_price']:.2f}" if sel["buy_price"] else "—",
-                "备注":   sel["note"] or "",
-            }
-            raw = {
-                "股票代码":   sel["code"],
-                "股票名称":   sel["name"] or "",
-                "选股日":     sel["select_date"],
-                "买入日":     sel["buy_date"] or "",
-                "买入价(元)": sel["buy_price"],
-                "备注":       sel["note"] or "",
-            }
-            for p in PERIODS:
-                tup  = metrics.get(f"{p}涨幅",     (None, ""))
-                htup = metrics.get(f"{p}最高涨幅", (None, ""))
-                base[f"{p}涨幅"]     = fmt_pct(tup)
-                base[f"{p}最高涨幅"] = fmt_pct(htup)
-                raw[f"{p}涨幅"]      = tup
-                raw[f"{p}最高涨幅"]  = htup
-            display_rows.append(base)
-            raw_rows.append(raw)
 
-        display_cols = (
-            ["代码", "名称", "选股日", "买入日", "买入价"]
-            + [f"{p}涨幅"     for p in PERIODS]
-            + [f"{p}最高涨幅" for p in PERIODS]
-            + ["备注"]
-        )
-        st.dataframe(
-            pd.DataFrame(display_rows)[display_cols],
-            use_container_width=True,
-            hide_index=True,
-            height=580,
-        )
+# ── 到期日计算 ────────────────────────────────────────────
+def calc_expiry_date(buy_date: str, months: int) -> str:
+    """自然月到期日，顺延至最近交易日"""
+    dt = datetime.strptime(buy_date, "%Y%m%d")
+    expiry = dt + relativedelta(months=months)
+    expiry_str = expiry.strftime("%Y%m%d")
+    look_ahead = (expiry + timedelta(days=10)).strftime("%Y%m%d")
+    days = db.get_trade_days(expiry_str, look_ahead)
+    return days[0] if days else expiry_str
 
-        st.divider()
-        if st.button("📥 生成 Excel"):
-            xlsx = ex.build_excel(raw_rows)
-            st.download_button(
-                label="⬇️ 下载 Excel",
-                data=xlsx,
-                file_name=f"选股追踪_{datetime.today().strftime('%Y%m%d')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+
+def nth_trade_day_after(buy_date: str, n: int) -> str | None:
+    """buy_date 之后第 n 个交易日"""
+    look = (datetime.strptime(buy_date, "%Y%m%d") + timedelta(days=30)).strftime("%Y%m%d")
+    days = db.get_trade_days(buy_date, look)
+    # days[0] == buy_date 本身，所以第n个交易日是 days[n]
+    return days[n] if len(days) > n else None
+
+
+# ── 涨幅计算 ──────────────────────────────────────────────
+def calc_metrics(sel: dict, today_str: str) -> dict:
+    code      = sel["code"]
+    buy_date  = sel["buy_date"]
+    buy_price = sel["buy_price"]
+
+    if not buy_date or not buy_price or buy_price == 0:
+        return {}
+
+    far_end = min(
+        (datetime.strptime(buy_date, "%Y%m%d") + relativedelta(months=4)).strftime("%Y%m%d"),
+        today_str
+    )
+    prices = db.get_prices(code, buy_date, far_end)
+    if not prices:
+        return {}
+
+    price_map      = {p["trade_date"]: p for p in prices}
+    all_trade_days = [p["trade_date"] for p in prices]
+    result         = {}
+
+    def pct(price):
+        return round((price / buy_price - 1) * 100, 2)
+
+    def compute(interval_days, target_date):
+        """给定区间交易日列表，计算收盘涨幅和最高涨幅"""
+        status = "进行中" if target_date > today_str else "已完成"
+        days = [d for d in interval_days if d <= today_str] if status == "进行中" else interval_days
+        if not days:
+            return (None, status), (None, status)
+        close = price_map[days[-1]]["close"]
+        highs = [price_map[d]["high"] for d in days]
+        return (pct(close), status), (pct(max(highs)), status)
+
+    # 5日、10日（固定交易日）
+    for n, label in [(5, "5日"), (10, "10日")]:
+        target = nth_trade_day_after(buy_date, n)
+        if target is None:
+            result[f"{label}涨幅"] = result[f"{label}最高涨幅"] = (None, "未到期")
+            continue
+        interval = [d for d in all_trade_days if d > buy_date and d <= target]
+        result[f"{label}涨幅"], result[f"{label}最高涨幅"] = compute(interval, target)
+
+    # 1月、2月、3月（自然月）
+    for m, label in [(1, "1月"), (2, "2月"), (3, "3月")]:
+        expiry   = calc_expiry_date(buy_date, m)
+        interval = [d for d in all_trade_days if d > buy_date and d <= expiry]
+        result[f"{label}涨幅"], result[f"{label}最高涨幅"] = compute(interval, expiry)
+
+    return result
+
+
+# ── 批量录入 ──────────────────────────────────────────────
+def fetch_selection_data(select_date: str, codes: list[str], note: str = "") -> list[dict]:
+    ensure_calendar()
+    pro   = get_pro()
+    buy_date = db.next_trade_day(select_date.replace("-", ""))
+    if not buy_date:
+        return [{"code": c, "status": "error", "msg": "找不到下一交易日"} for c in codes]
+
+    results = []
+    for code in codes:
+        try:
+            name = get_stock_name(code)
+            df = pro.daily(
+                ts_code=code, start_date=buy_date, end_date=buy_date,
+                fields="ts_code,trade_date,open,high,close"
             )
+            if df is None or df.empty:
+                results.append({"code": code, "name": name,
+                                 "status": "error", "msg": "无买入日价格数据"})
+                continue
+
+            row       = df.iloc[0]
+            buy_price = float(row["open"])
+            db.upsert_price(code, buy_date, row["open"], row["high"], row["close"])
+
+            # 拉后续3个月价格
+            far = (datetime.strptime(buy_date, "%Y%m%d")
+                   + relativedelta(months=3, days=10)).strftime("%Y%m%d")
+            fetch_price_range(code, buy_date, far)
+
+            select_date_str = select_date.replace("-", "")
+            if db.is_duplicate(select_date_str, code, note):
+                results.append({
+                    "code": code, "name": name, "status": "skip",
+                    "msg": "已存在相同选股日+代码+备注，已跳过"
+                })
+            else:
+                db.insert_selection(
+                    select_date_str, buy_date,
+                    code, name, buy_price, note
+                )
+                results.append({
+                    "code": code, "name": name, "status": "ok",
+                    "buy_date": buy_date, "buy_price": buy_price
+                })
+        except Exception as e:
+            results.append({"code": code, "status": "error", "msg": str(e)})
+
+    return results
 
 
-# ════════════════════════════════════════════════════════
-# Tab 3：统计分析
-# ════════════════════════════════════════════════════════
-with tab3:
-    st.subheader("统计分析")
+def refresh_prices() -> int:
+    """更新所有进行中股票的最新价格"""
+    ensure_calendar()
+    today = datetime.today().strftime("%Y%m%d")
+    sels  = db.get_all_selections()
+    updated = 0
+    for sel in sels:
+        if not sel["buy_date"]:
+            continue
+        far = (datetime.strptime(sel["buy_date"], "%Y%m%d")
+               + relativedelta(months=3, days=10)).strftime("%Y%m%d")
+        end = min(far, today)
+        if sel["buy_date"] <= today:
+            fetch_price_range(sel["code"], sel["buy_date"], end)
+            updated += 1
+    return updated
 
-    sels = all_selections
+
+def calc_all_metrics(sels: list[dict], today_str: str) -> list[dict]:
+    """
+    批量计算所有选股记录的涨幅指标。
+    只做2次数据库查询（price_cache + trade_calendar），
+    避免在循环里反复建连接导致连接池耗尽。
+    """
     if not sels:
-        st.info("暂无数据")
-    else:
-        today_str = datetime.today().strftime("%Y%m%d")
-        all_m = []
-        for sel in sels:
-            m = ds.calc_metrics(sel, today_str)
-            m["select_date"] = sel["select_date"]
-            all_m.append(m)
+        return []
 
-        def _stats(subset):
-            r = {}
-            for p in PERIODS:
-                vals  = [m[f"{p}涨幅"][0]     for m in subset
-                         if isinstance(m.get(f"{p}涨幅"), tuple)
-                         and m[f"{p}涨幅"][0] is not None]
-                highs = [m[f"{p}最高涨幅"][0] for m in subset
-                         if isinstance(m.get(f"{p}最高涨幅"), tuple)
-                         and m[f"{p}最高涨幅"][0] is not None]
-                r[f"{p}均涨幅"] = f"{sum(vals)/len(vals):+.2f}%"   if vals  else "—"
-                r[f"{p}均最高"] = f"{sum(highs)/len(highs):+.2f}%" if highs else "—"
-                r[f"{p}胜率"]   = f"{sum(1 for v in vals if v>0)/len(vals)*100:.0f}%" if vals else "—"
-            return r
+    # 找出所有涉及的日期范围
+    all_codes = list({s["code"] for s in sels if s.get("buy_date")})
+    min_date  = min((s["buy_date"] for s in sels if s.get("buy_date")), default=None)
+    if not min_date:
+        return [{} for _ in sels]
 
-        st.markdown("### 全部选股汇总")
-        total = _stats(all_m)
-        cols  = st.columns(5)
-        for col, p in zip(cols, PERIODS):
-            col.metric(f"{p} 均涨幅", total[f"{p}均涨幅"])
-        st.markdown("#### 各周期胜率")
-        cols2 = st.columns(5)
-        for col, p in zip(cols2, PERIODS):
-            col.metric(f"{p} 胜率", total[f"{p}胜率"])
+    far_end = min(
+        (datetime.strptime(min_date, "%Y%m%d") + relativedelta(months=4, days=10)).strftime("%Y%m%d"),
+        today_str
+    )
+    # 取最晚的buy_date往后推4个月
+    max_buy  = max(s["buy_date"] for s in sels if s.get("buy_date"))
+    far_end2 = min(
+        (datetime.strptime(max_buy, "%Y%m%d") + relativedelta(months=4, days=10)).strftime("%Y%m%d"),
+        today_str
+    )
+    far_end  = max(far_end, far_end2)
 
-        st.divider()
+    # 一次性拉所有交易日
+    all_trade_days_list = db.get_trade_days(min_date, far_end)
+    trade_day_set       = set(all_trade_days_list)
 
-        st.markdown("### 按选股日分组")
-        stat_rows = []
-        for dk, grp in groupby(
-            sorted(all_m, key=lambda x: x["select_date"]),
-            key=lambda x: x["select_date"]
-        ):
-            g = list(grp)
-            r = {"选股日": dk, "股票数": len(g)}
-            r.update(_stats(g))
-            stat_rows.append(r)
+    # 一次性拉所有股票价格（按code分组）
+    price_by_code: dict[str, dict[str, dict]] = {}
+    for code in all_codes:
+        rows = db.get_prices(code, min_date, far_end)
+        price_by_code[code] = {r["trade_date"]: r for r in rows}
 
-        show_cols = (["选股日", "股票数"]
-                     + [f"{p}均涨幅" for p in PERIODS]
-                     + [f"{p}胜率"   for p in PERIODS])
-        st.dataframe(
-            pd.DataFrame(stat_rows)[show_cols],
-            use_container_width=True,
-            hide_index=True,
-        )
+    results = []
+    for sel in sels:
+        code      = sel.get("code")
+        buy_date  = sel.get("buy_date")
+        buy_price = sel.get("buy_price")
+
+        if not buy_date or not buy_price or buy_price == 0 or code not in price_by_code:
+            results.append({})
+            continue
+
+        price_map      = price_by_code[code]
+        sel_trade_days = sorted(d for d in price_map if d >= buy_date)
+
+        def pct(price):
+            return round((price / buy_price - 1) * 100, 2)
+
+        def compute(interval_days, target_date):
+            status = "进行中" if target_date > today_str else "已完成"
+            days   = [d for d in interval_days if d <= today_str] if status == "进行中" else interval_days
+            if not days:
+                return (None, status), (None, status)
+            close = price_map[days[-1]]["close"]
+            highs = [price_map[d]["high"] for d in days]
+            return (pct(close), status), (pct(max(highs)), status)
+
+        result = {}
+
+        # 5日、10日
+        for n, label in [(5, "5日"), (10, "10日")]:
+            after = [d for d in sel_trade_days if d > buy_date]
+            target = after[n - 1] if len(after) >= n else None
+            if target is None:
+                result[f"{label}涨幅"] = result[f"{label}最高涨幅"] = (None, "未到期")
+                continue
+            interval = [d for d in sel_trade_days if d > buy_date and d <= target]
+            result[f"{label}涨幅"], result[f"{label}最高涨幅"] = compute(interval, target)
+
+        # 1月、2月、3月
+        for m, label in [(1, "1月"), (2, "2月"), (3, "3月")]:
+            expiry   = calc_expiry_date(buy_date, m)
+            interval = [d for d in sel_trade_days if d > buy_date and d <= expiry]
+            result[f"{label}涨幅"], result[f"{label}最高涨幅"] = compute(interval, expiry)
+
+        results.append(result)
+
+    return results
